@@ -1,0 +1,28 @@
+from beam_model import evaluate_beam
+from ollama import chat
+
+def ask_llama(prompt):
+    response = chat(
+    model="llama3.2:1b",
+    messages=[
+    {"role": "user", "content": prompt}
+    ]
+    )
+    return response.message.content
+
+
+def llama_decision(a):
+    prompt = f"""
+    provide a optimal height and width to meet the parameters given by {a} please only provide those 2 numbers with units in millimeters and nothing else,
+    no comments or explanations just the width and height with the units milimeters or mm in the format of "width: 100 mm, height: 200 mm""
+    """
+    response = ask_llama(prompt)
+    Q = response.strip()
+    return Q
+
+result = evaluate_beam(50, 80)
+
+print(result)
+
+
+print(llama_decision(result))
