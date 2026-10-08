@@ -1,28 +1,156 @@
+import os
+import re
+from pathlib import Path
 from beam_model import evaluate_beam
-from ollama import chat
+from ollama import chat as ollama_chat
+import openai
 
-def ask_llama(prompt):
-    response = chat(
-    model="llama3.2:1b",
-    messages=[
-    {"role": "user", "content": prompt}
-    ]
+# ----------------------------------------------------
+# Read API Key directly from .env file
+# ----------------------------------------------------
+env_file_path = Path(__file__).resolve().parent / ".env"
+
+if not env_file_path.exists():
+    raise FileNotFoundError(f"Could not find .env file at {env_file_path}")
+
+with open(env_file_path, "r", encoding="utf-8") as f:
+    raw_content = f.read().strip()
+
+raw_key = raw_content.split("=")[-1].strip().strip('"').strip("'")
+openai_client = openai.OpenAI(api_key=raw_key)
+
+
+# ----------------------------------------------------
+# 1. Prompt & Query Functions
+# ----------------------------------------------------
+def build_agent_prompt(history):
+    prompt = """ (this prompt was ai generated)
+You are an engineering AI optimizing a rectangular steel beam cross-section.
+Objective: Minimize total beam mass.
+Design Bounds:
+- Width: 20.0 mm to 100.0 mm
+- Height: 40.0 mm to 120.0 mm
+
+Constraints:
+- Maximum Midspan Deflection: <= 1.0 mm
+- Maximum von Mises Stress: <= 120.0 MPa
+
+Below is the history of previous design evaluations:
+"""
+    for entry in history:
+        prompt += (
+            f"- Candidate: width: {entry['w']} mm, height: {entry['h']} mm | "
+            f"Mass: {entry['mass']:.2f} kg, Deflection: {entry['deflection']:.3f} mm, "
+            f"Stress: {entry['stress']:.1f} MPa, Feasible: {entry['feasible']}\n"
+        )
+
+    prompt += """
+Based on this feedback history, propose the NEXT width and height to reduce mass while maintaining feasibility.
+
+STRICT FORMAT REQUIREMENT: Respond ONLY with the proposal in this exact format:
+"width: <value> mm, height: <value> mm"
+Do NOT include any additional explanation or commentary.
+"""
+    return prompt
+
+
+def query_llm(provider, model_name, prompt):
+    if provider == "ollama":
+        response = ollama_chat(
+            model=model_name,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return response.message.content.strip()
+        
+    elif provider == "openai":
+        response = openai_client.chat.completions.create(
+            model=model_name,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2
+        )
+        return response.choices[0].message.content.strip()
+
+
+def parse_response(response_text):
+    """Extracts width and height in mm."""
+    pattern = r"width\s*:\s*([\d\.]+)\s*mm\s*,\s*height\s*:\s*([\d\.]+)\s*mm"
+    match = re.search(pattern, response_text, re.IGNORECASE)
+    
+    if match:
+        try:
+            w = float(match.group(1))
+            h = float(match.group(2))
+            return w, h
+        except ValueError:
+            pass
+    return None, None
+
+
+# ----------------------------------------------------
+# 2. Agent Decision Loop
+# ----------------------------------------------------
+def run_agent_loop(provider, model_name, run_number):
+    print(f"\n==================================================")
+    print(f"  Running {model_name} ({provider.upper()}) - Run #{run_number}")
+    print(f"==================================================")
+
+    history = []
+
+    # Iteration 0: Common starting design (50 mm, 80 mm)
+    w_start, h_start = 50.0, 80.0
+    res_start = evaluate_beam(w_start, h_start)
+    
+    # Using exact dictionary keys from provided beam_model.py
+    history.append({
+        'w': w_start, 'h': h_start,
+        'mass': res_start['mass_kg'],
+        'deflection': res_start['max_deflection_mm'],
+        'stress': res_start['max_von_mises_stress_MPa'],
+        'feasible': res_start['feasible']
+    })
+
+    print(
+        f"Iter 0 (Start): width: {w_start} mm, height: {h_start} mm -> "
+        f"Mass: {res_start['mass_kg']:.2f} kg, Deflection: {res_start['max_deflection_mm']:.3f} mm, "
+        f"Stress: {res_start['max_von_mises_stress_MPa']:.1f} MPa, Feasible: {res_start['feasible']}"
     )
-    return response.message.content
+
+    # 11 model proposals
+    for prop_idx in range(1, 12):
+        prompt = build_agent_prompt(history)
+        raw_response = query_llm(provider, model_name, prompt)
+        parsed_w, parsed_h = parse_response(raw_response)
+
+        if parsed_w is not None and parsed_h is not None:
+            try:
+                # Call evaluator with exact key mapping
+                eval_res = evaluate_beam(parsed_w, parsed_h)
+                history.append({
+                    'w': parsed_w, 'h': parsed_h,
+                    'mass': eval_res['mass_kg'],
+                    'deflection': eval_res['max_deflection_mm'],
+                    'stress': eval_res['max_von_mises_stress_MPa'],
+                    'feasible': eval_res['feasible']
+                })
+                print(
+                    f"Prop {prop_idx:02d}: width: {parsed_w} mm, height: {parsed_h} mm -> "
+                    f"Mass: {eval_res['mass_kg']:.2f} kg, Deflection: {eval_res['max_deflection_mm']:.3f} mm, "
+                    f"Stress: {eval_res['max_von_mises_stress_MPa']:.1f} MPa, Feasible: {eval_res['feasible']}"
+                )
+            except ValueError as e:
+                # Catches out-of-bounds proposals per project instructions
+                print(f"Prop {prop_idx:02d}: INVALID PROPOSAL (Out of Bounds) -> {e}")
+        else:
+            print(f"Prop {prop_idx:02d}: INVALID REPLY (Format Error) -> '{raw_response}'")
 
 
-def llama_decision(a):
-    prompt = f"""
-    provide a optimal height and width to meet the parameters given by {a} please only provide those 2 numbers with units in millimeters and nothing else,
-    no comments or explanations just the width and height with the units milimeters or mm in the format of "width: 100 mm, height: 200 mm""
-    """
-    response = ask_llama(prompt)
-    Q = response.strip()
-    return Q
+# Task 1 Check
+print("Task 1 Starting Design Output:")
+print(evaluate_beam(50, 80))
 
-result = evaluate_beam(50, 80)
+# Task 4 & 5 Runs
+run_agent_loop("ollama", "llama3.2:1b", run_number=1)
+run_agent_loop("ollama", "llama3.2:1b", run_number=2)
 
-print(result)
-
-
-print(llama_decision(result))
+run_agent_loop("openai", "gpt-4o-mini", run_number=1)
+run_agent_loop("openai", "gpt-4o-mini", run_number=2)
